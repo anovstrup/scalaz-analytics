@@ -151,20 +151,23 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     case class Split(f: RowFunction, g: RowFunction)          extends RowFunction
     case class Product(fab: RowFunction)                      extends RowFunction
     case class Column(colName: String, rType: Reified)        extends RowFunction
+    case class ExtractFst(reified: Reified)                   extends RowFunction
+    case class ExtractSnd(reified: Reified)                   extends RowFunction
 
     // constants
-    case class IntLiteral(value: Int)                 extends RowFunction
-    case class LongLiteral(value: Long)               extends RowFunction
-    case class FloatLiteral(value: Float)             extends RowFunction
-    case class DoubleLiteral(value: Double)           extends RowFunction
-    case class DecimalLiteral(value: BigDecimal)      extends RowFunction
-    case class StringLiteral(value: String)           extends RowFunction
-    case class BooleanLiteral(value: Boolean)         extends RowFunction
-    case class ByteLiteral(value: Byte)               extends RowFunction
-    case object NullLiteral                           extends RowFunction
-    case class ShortLiteral(value: Short)             extends RowFunction
-    case class TimestampLiteral(value: LocalDateTime) extends RowFunction
-    case class DateLiteral(value: LocalDate)          extends RowFunction
+    case class IntLiteral(value: Int)                            extends RowFunction
+    case class LongLiteral(value: Long)                          extends RowFunction
+    case class FloatLiteral(value: Float)                        extends RowFunction
+    case class DoubleLiteral(value: Double)                      extends RowFunction
+    case class DecimalLiteral(value: BigDecimal)                 extends RowFunction
+    case class StringLiteral(value: String)                      extends RowFunction
+    case class BooleanLiteral(value: Boolean)                    extends RowFunction
+    case class ByteLiteral(value: Byte)                          extends RowFunction
+    case object NullLiteral                                      extends RowFunction
+    case class ShortLiteral(value: Short)                        extends RowFunction
+    case class TimestampLiteral(value: LocalDateTime)            extends RowFunction
+    case class DateLiteral(value: LocalDate)                     extends RowFunction
+    case class Tuple2Literal(fst: RowFunction, snd: RowFunction) extends RowFunction
   }
 
   override val stdLib: StandardLibrary = new StandardLibrary {
@@ -181,6 +184,10 @@ trait LocalAnalyticsModule extends AnalyticsModule {
       RowFunction.Split(f, g)
 
     override def product[A, B](fab: A =>: B): (A, A) =>: (B, B) = RowFunction.Product(fab)
+
+    override def fst[A: Type, B]: (A, B) =>: A = RowFunction.ExtractFst(Type[A].reified)
+
+    override def snd[A, B: Type]: (A, B) =>: B = RowFunction.ExtractSnd(Type[B].reified)
   }
 
   override def empty[A: Type]: LocalDataStream = LocalDataStream.Empty(LocalType.typeOf[A])
@@ -202,6 +209,8 @@ trait LocalAnalyticsModule extends AnalyticsModule {
   implicit override def timestamp[A](v: LocalDateTime): A =>: LocalDateTime =
     RowFunction.TimestampLiteral(v)
   implicit override def date[A](v: LocalDate): A =>: LocalDate = RowFunction.DateLiteral(v)
+  implicit override def tuple2[A, B, C](t: (A =>: B, A =>: C)): A =>: (B, C) =
+    RowFunction.Tuple2Literal(t._1, t._2)
 
   // todo this needs more thought
   override def column[A: Type](str: String): Unknown =>: A =
