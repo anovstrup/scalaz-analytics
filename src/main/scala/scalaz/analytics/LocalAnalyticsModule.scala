@@ -2,7 +2,8 @@ package scalaz.analytics
 
 import scalaz.zio.IO
 import scala.language.implicitConversions
-import java.time.{ Instant, LocalDate }
+import java.time.{Instant, LocalDate}
+import scala.math.Numeric._
 
 /**
  * A non distributed implementation of Analytics Module
@@ -109,6 +110,8 @@ trait LocalAnalyticsModule extends AnalyticsModule {
   object LocalDataStream {
     case class Empty(rType: Reified) extends LocalDataStream
 
+    case class Iter[A](rType: Reified, data: Iterable[A]) extends LocalDataStream
+
     case class Map(d: LocalDataStream, f: RowFunction)    extends LocalDataStream
     case class Filter(d: LocalDataStream, f: RowFunction) extends LocalDataStream
 
@@ -123,8 +126,8 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     override def filter[A](ds: LocalDataStream)(f: A =>: Boolean): LocalDataStream =
       LocalDataStream.Filter(ds, f)
 
-    override def fold[A, B](ds: LocalDataStream)(window: Window)(initial: A =>: B)(
-      f: (B, A) =>: B
+    override def fold[A, B](ds: LocalDataStream)(window: Window)(initial: B =>: B)(
+      f: A =>: B
     ): LocalDataStream = LocalDataStream.Fold(ds, initial, f, window)
     override def distinct[A](ds: LocalDataStream)(window: Window): LocalDataStream =
       LocalDataStream.Distinct(ds, window)
@@ -187,6 +190,8 @@ trait LocalAnalyticsModule extends AnalyticsModule {
 
   override def emptyStream[A: Type]: LocalDataStream = LocalDataStream.Empty(LocalType.typeOf[A])
 
+  override def fromIterable[A: LocalType](iterable: Iterable[A]): LocalDataStream = LocalDataStream.Iter[A](LocalType.typeOf[A], iterable)
+
   implicit override def int[A](v: scala.Int): A =>: Int          = RowFunction.IntLiteral(v)
   implicit override def long[A](v: scala.Long): A =>: Long       = RowFunction.LongLiteral(v)
   implicit override def float[A](v: scala.Float): A =>: Float    = RowFunction.FloatLiteral(v)
@@ -209,5 +214,129 @@ trait LocalAnalyticsModule extends AnalyticsModule {
 
   def load(path: String): DataStream[Unknown] = ???
 
-  def run[A](d: DataStream[A]): IO[Error, Seq[A]] = ???
+  def execute[A](dataStream: DataSet[A]): IO[Throwable, Seq[A]] =
+    localRun(dataStream)
+
+  def localRun[A](dataStream: LocalDataStream): IO[Throwable, Seq[A]] =
+    compile(dataStream)
+
+  def compile[A](dataStream: LocalDataStream): IO[Throwable, Seq[A]] = dataStream match {
+    case LocalDataStream.Empty(_) =>
+      IO.point(Seq.empty[A])
+    case LocalDataStream.Iter(_, data) =>
+      IO.point(data.asInstanceOf[Iterable[A]].toSeq)
+    case LocalDataStream.Map(data, fun) =>
+      val funCompiled = compile[A, A](fun)
+      compile(data).flatMap(seq => funCompiled.map(seq.map(_)))
+    case LocalDataStream.Filter(data, fun) =>
+      val funCompiled = compile[A, Boolean](fun)
+      compile(data).flatMap(seq => funCompiled.map(seq.filter))
+    case LocalDataStream.Distinct(data, _) =>
+      compile(data).map(_.distinct)
+    case LocalDataStream.Fold(data, init, fun, _) =>
+      val initCompiled = compile[A, A](init)
+      val funCompiled = compile2[A, A](fun)
+      compile(data).flatMap(seq => initCompiled.par(funCompiled).map {
+        case (zero, f) => Seq(seq.fold(zero(null.asInstanceOf[A]))(f))
+      })
+    case _ =>
+      IO.fail(new IllegalArgumentException("something goes wrong"))
+  }
+
+  def compile[A, B](rowFunction: RowFunction): IO[Throwable, A => B] = rowFunction match {
+    case lit if isLiteral(lit) =>
+      literal[B](lit).flatMap(mkEmptyFun1)
+    case RowFunction.Id(_) =>
+      IO.point(identityFun[A, B])
+    case RowFunction.Compose(op, RowFunction.FanOut(left, right)) if isBinaryOp(op) =>
+      compileOp[A, B](op).par(compile[A, A](left)).par(compile[A, A](right)).map {
+        case ((fun, l), r) => x: A => fun(l(x), r(x))
+      }
+  }
+
+  def compile2[A, B](rowFunction: RowFunction): IO[Throwable, (A, A) => B] = rowFunction match {
+    case RowFunction.Compose(op, RowFunction.FanOut(left, right)) if isBinaryOp(op) =>
+      compileOp[A, B](op).par(compile[A, A](left)).par(compile[A, A](right)).map {
+        case ((fun, l), r) => (x: A, y: A) => fun(l(x), r(y))
+      }
+  }
+
+  def compileOp[A, B](operator: RowFunction): IO[Throwable, (A, A) => B] = operator match {
+    case RowFunction.Mult(rType) => integral[A](rType).map(mulFun)
+    case RowFunction.Sum(rType) => integral[A](rType).map(sumFun)
+    case RowFunction.Diff(rType) => integral[A](rType).map(diffFun)
+    case RowFunction.Mod(rType) => integral[A](rType).map(modFun)
+    case RowFunction.GreaterThan(rType) => integral[A](rType).map(greaterThan)
+    case _ => IO.fail(new NotImplementedError)
+  }
+
+  def literal[A](rowFunction: RowFunction): IO[Throwable, A] = rowFunction match {
+    case RowFunction.ByteLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.ShortLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.IntLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.LongLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.FloatLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.DoubleLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.DecimalLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.BooleanLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.StringLiteral(value) => IO.now(value.asInstanceOf[A])
+    case RowFunction.NullLiteral => IO.now(null.asInstanceOf[A])
+    case _ => IO.fail(new IllegalStateException(s"$rowFunction is not literal"))
+  }
+
+  def isLiteral(rowFunction: RowFunction): Boolean = rowFunction match {
+    case RowFunction.IntLiteral(_) => true
+    case RowFunction.LongLiteral(_) => true
+    case RowFunction.FloatLiteral(_) => true
+    case RowFunction.DoubleLiteral(_) => true
+    case RowFunction.DecimalLiteral(_) => true
+    case RowFunction.StringLiteral(_) => true
+    case RowFunction.BooleanLiteral(_) => true
+    case RowFunction.ByteLiteral(_) => true
+    case RowFunction.NullLiteral => true
+    case RowFunction.ShortLiteral  (_) => true
+    case _ => false
+  }
+
+  def isBinaryOp(rowFunction: RowFunction): Boolean = rowFunction match {
+    case RowFunction.Mult(_) => true
+    case RowFunction.Sum(_) => true
+    case RowFunction.Diff(_) => true
+    case RowFunction.Mod(_) => true
+    case RowFunction.GreaterThan(_) => true
+    case _ => false
+  }
+
+  def integral[A](reified: Reified): IO[Throwable, Integral[A]] =
+    reified match {
+      case Reified.Byte => IO.now(ByteIsIntegral.asInstanceOf[scala.Integral[A]])
+      case Reified.Short => IO.now(ShortIsIntegral.asInstanceOf[scala.Integral[A]])
+      case Reified.Int => IO.now(IntIsIntegral.asInstanceOf[scala.Integral[A]])
+      case Reified.Long => IO.now(LongIsIntegral.asInstanceOf[scala.Integral[A]])
+      case Reified.Float => IO.now(FloatAsIfIntegral.asInstanceOf[scala.Integral[A]])
+      case Reified.Double => IO.now(DoubleAsIfIntegral.asInstanceOf[scala.Integral[A]])
+      case Reified.BigDecimal => IO.now(BigDecimalAsIfIntegral.asInstanceOf[scala.Integral[A]])
+      case _ => IO.fail(new IllegalStateException(s"$reified doesn't have integral"))
+    }
+
+  def mulFun[A, B](integral: Integral[A]): (A, A) => B = (x: A, y: A) =>
+    integral.times(x, y).asInstanceOf[B]
+
+  def sumFun[A, B](integral: Integral[A]): (A, A) => B = (x: A, y: A) =>
+    integral.plus(x, y).asInstanceOf[B]
+
+  def diffFun[A, B](integral: Integral[A]): (A, A) => B = (x: A, y: A) =>
+    integral.minus(x, y).asInstanceOf[B]
+
+  def modFun[A, B](integral: Integral[A]): (A, A) => B = (x: A, y: A) =>
+    integral.rem(x, y).asInstanceOf[B]
+
+  def greaterThan[A, B](integral: Integral[A]): (A, A) => B = (x: A, y: A) =>
+    integral.gt(x, y).asInstanceOf[B]
+
+  def identityFun[A, B](a: A): B = a.asInstanceOf[B]
+
+  def mkEmptyFun1[A, B](b: B): IO[Throwable, A => B] = IO.point {
+    _: A => b
+  }
 }

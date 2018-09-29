@@ -105,7 +105,7 @@ trait AnalyticsModule {
     def filter[A](ds: F[A])(f: A =>: Boolean): F[A]
 
     // Bounded
-    def fold[A, B](ds: F[A])(window: Window)(initial: A =>: B)(f: (B, A) =>: B): F[B]
+    def fold[A, B](ds: F[A])(window: Window)(initial: B =>: B)(f: A =>: B): F[B]
     def distinct[A](ds: F[A])(window: Window): F[A]
   }
 
@@ -159,8 +159,8 @@ trait AnalyticsModule {
     def filter(f: (A =>: A) => (A =>: Boolean)): DataSet[A] =
       setOps.filter(ds)(f(stdLib.id))
 
-    def fold[B: Type](init: A =>: B)(f: (B, A) =>: B): DataSet[B] =
-      setOps.fold(ds)(Window.GlobalWindow())(init)(f)
+    def fold[B: Type](init: B =>: B)(f: (B =>: B, A =>: A) => (A =>: B)): DataSet[B] =
+      setOps.fold(ds)(Window.GlobalWindow())(init)(f(stdLib.id[B], stdLib.id[A]))
 
     def distinct: DataSet[A] =
       setOps.distinct(ds)(Window.GlobalWindow())
@@ -172,12 +172,12 @@ trait AnalyticsModule {
   implicit class DataStreamSyntax[A](ds: DataStream[A])(implicit A: Type[A]) {
 
     def map[B: Type](f: (A =>: A) => (A =>: B)): DataStream[B] =
-      streamOps.map(ds)(f(stdLib.id))
+      streamOps.map(ds)(f(stdLib.id[A]))
 
     def filter(f: (A =>: A) => (A =>: Boolean)): DataStream[A] =
-      streamOps.filter(ds)(f(stdLib.id))
+      streamOps.filter(ds)(f(stdLib.id[A]))
 
-    def fold[B: Type](window: Window)(init: A =>: B)(f: (B, A) =>: B): DataStream[B] =
+    def fold[B: Type](window: Window)(init: B =>: B)(f: A =>: B): DataStream[B] =
       streamOps.fold(ds)(window)(init)(f)
 
     def distinct(window: Window): DataStream[A] =
@@ -194,6 +194,8 @@ trait AnalyticsModule {
    */
   def emptyStream[A: Type]: DataStream[A]
 
+  def fromIterable[A: Type](iter: Iterable[A]): DataSet[A]
+
   // Entry points for various supported scala types into the Analytics Language
   implicit def int[A](v: scala.Int): A =>: Int
   implicit def long[A](v: scala.Long): A =>: Long
@@ -207,6 +209,7 @@ trait AnalyticsModule {
   implicit def short[A](v: scala.Short): A =>: Short
   implicit def instant[A](v: java.time.Instant): A =>: java.time.Instant
   implicit def localDate[A](v: java.time.LocalDate): A =>: java.time.LocalDate
+
 
   val setOps: Ops[DataSet]
   val streamOps: Ops[DataStream]
@@ -225,5 +228,5 @@ trait AnalyticsModule {
   /**
    * Execute the [[DataStream]] or [[DataSet]]
    */
-  def run[A](d: DataStream[A]): IO[Error, Seq[A]]
+  def execute[A](d: DataSet[A]): IO[Throwable, Seq[A]]
 }
