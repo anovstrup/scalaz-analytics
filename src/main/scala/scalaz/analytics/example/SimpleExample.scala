@@ -12,16 +12,17 @@ object SimpleExample extends App {
   override def run(args: List[String]) =
     doit().attempt.map(_.fold(e => {e.printStackTrace(); 1}, _ => 0)).map(ExitStatus.ExitNow(_))
 
-  def doit() = {
-    println(ds1)
-
+  def doit() =
     for {
+      _ <- putStrLn(ds1)
       seq <- execute(ds1)
       _ <- putStrLn(seq.mkString(","))
       fold <- execute(folded)
       _ <- putStrLn(fold.mkString(","))
+      _ <- putStrLn(ds2)
+      _ <- putStrLn(tupleExample)
+      _ <- putStrLn(tupleExample2)
     } yield ()
-  }
 
   val ds1: DataSet[Int] =
     fromIterable(Seq(4, 3, 2, 1))
@@ -37,4 +38,15 @@ object SimpleExample extends App {
     emptyStream[Int]
       .filter(i => i + 1 > 0)
       .distinct(Window.FixedTimeWindow())
+
+  val tupleExample: DataSet[(Int, Boolean)] =
+    empty[(Int, String)]
+      .map(_ => (4, false))
+      .filter(_._2)
+
+  val tupleExample2: DataSet[(Int, String)] =
+    empty[(Int, String)]
+      .map(_ => (4, false)) // tuple of literals works
+      .map(s => (3, s._1)) // tuple with right side projection
+      .map(s => (s._2, "")) // tuple with left side projection
 }
