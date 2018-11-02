@@ -94,6 +94,9 @@ trait AnalyticsModule {
 
     def combine[C](that: A =>: C): A =>: (B, C) = stdLib.fanOut(self, that)
     def &&& [C](that: A =>: C): A =>: (B, C)    = stdLib.fanOut(self, that)
+
+    def product[C, D](that: C =>: D): (A, C) =>: (B, D) = stdLib.split(self, that)
+    def *** [C, D](that: C =>: D): (A, C) =>: (B, D) = stdLib.split(self, that)
   }
 
   /**
@@ -102,17 +105,21 @@ trait AnalyticsModule {
   trait Ops[F[_]] {
     // Unbounded
     def map[A, B](ds: F[A])(f: A =>: B): F[B]
+    def flatMap[A, B](ds: F[A])(f: A =>: F[B]): F[B]
     def filter[A](ds: F[A])(f: A =>: Boolean): F[A]
 
+    // the semantics of these unbounded ops differ between bounded/unbounded datasets
+    def aggregateBy[A, K, V](ds: F[A])(g: A =>: K)(init: Unit =>: V)(f: (V, A) =>: V): DataSet[(K, V)]
+
     // Bounded
-    def fold[A, B](ds: F[A])(window: Window)(initial: B =>: B)(f: A =>: B): F[B]
+    def fold[A, B](ds: F[A])(window: Window)(initial: Unit =>: B)(f: (B, A) =>: B): F[B]
     def distinct[A](ds: F[A])(window: Window): F[A]
   }
 
   /**
    * The standard library of scalaz-analytics.
    */
-  trait StandardLibrary extends TupleLibrary {
+  trait StandardLibrary extends TupleLibrary with StringLibrary {
     def id[A: Type]: A =>: A
     def compose[A, B, C](f: B =>: C, g: A =>: B): A =>: C
     def andThen[A, B, C](f: A =>: B, g: B =>: C): A =>: C
@@ -124,6 +131,11 @@ trait AnalyticsModule {
   trait TupleLibrary {
     def fst[A: Type, B]: (A, B) =>: A
     def snd[A, B: Type]: (A, B) =>: B
+  }
+
+  trait StringLibrary {
+    def strSplit[F[_]](pattern: String): String =>: F[String]
+    def concat: (String, String) =>: String
   }
 
   trait Numeric[A] {
@@ -153,6 +165,11 @@ trait AnalyticsModule {
     def > (r: A =>: B)(implicit B: Numeric[B]): A =>: Boolean = (l &&& r) >>> B.greaterThan
   }
 
+  implicit class StringSyntax[A](val l: A =>: String) {
+    def split[F[_]](pattern: String): A =>: F[String] = l >>> stdLib.strSplit(pattern)
+    def concat(r: A =>: String): A =>: String = (l &&& r) >>> stdLib.concat
+  }
+
   /**
    * A DSL for building the DataSet data structure
    */
@@ -161,11 +178,22 @@ trait AnalyticsModule {
     def map[B: Type](f: (A =>: A) => (A =>: B)): DataSet[B] =
       setOps.map(ds)(f(stdLib.id))
 
+    def flatMap[B: Type](f: (A =>: A) => (A =>: DataSet[B])): DataSet[B] =
+      setOps.flatMap(ds)(f(stdLib.id))
+
     def filter(f: (A =>: A) => (A =>: Boolean)): DataSet[A] =
       setOps.filter(ds)(f(stdLib.id))
 
-    def fold[B: Type](init: B =>: B)(f: (B =>: B, A =>: A) => (A =>: B)): DataSet[B] =
-      setOps.fold(ds)(Window.GlobalWindow())(init)(f(stdLib.id[B], stdLib.id[A]))
+    def aggregate[V: Type](init: V)(f: (V, A) =>: (V, A) => ((V, A) =>: V))(implicit ev: V => Unit =>: V): DataSet[(A, V)] =
+      aggregateBy(identity)(init)(f)
+
+    def aggregateBy[K: Type, V: Type](g: (A =>: A) => (A =>: K))
+                                     (init: V)
+                                     (f: (V, A) =>: (V, A) => ((V, A) =>: V))(implicit ev: V => Unit =>: V): DataSet[(K, V)] =
+      setOps.aggregateBy(ds)(g(stdLib.id))(ev(init))(f(stdLib.id))
+
+    def fold[B: Type](init: B)(f: (B, A) =>: (B, A) => ((B, A) =>: B))(implicit ev: B => Unit =>: B): DataSet[B] =
+      setOps.fold(ds)(Window.GlobalWindow())(ev(init))(f(stdLib.id[(B, A)]))
 
     def distinct: DataSet[A] =
       setOps.distinct(ds)(Window.GlobalWindow())
@@ -177,13 +205,16 @@ trait AnalyticsModule {
   implicit class DataStreamSyntax[A](ds: DataStream[A])(implicit A: Type[A]) {
 
     def map[B: Type](f: (A =>: A) => (A =>: B)): DataStream[B] =
-      streamOps.map(ds)(f(stdLib.id[A]))
+      streamOps.map(ds)(f(stdLib.id))
+
+    def flatMap[B: Type](f: (A =>: A) => (A =>: DataStream[B])): DataStream[B] =
+      streamOps.flatMap(ds)(f(stdLib.id))
 
     def filter(f: (A =>: A) => (A =>: Boolean)): DataStream[A] =
-      streamOps.filter(ds)(f(stdLib.id[A]))
+      streamOps.filter(ds)(f(stdLib.id))
 
-    def fold[B: Type](window: Window)(init: B =>: B)(f: A =>: B): DataStream[B] =
-      streamOps.fold(ds)(window)(init)(f)
+    def fold[B: Type](window: Window)(init: B)(f: (B, A) =>: (B, A) => ((B, A) =>: B))(implicit ev: B => Unit =>: B): DataStream[B] =
+      streamOps.fold(ds)(window)(ev(init))(f(stdLib.id))
 
     def distinct(window: Window): DataStream[A] =
       streamOps.distinct(ds)(window)
@@ -223,18 +254,14 @@ trait AnalyticsModule {
   implicit def short[A](v: scala.Short): A =>: Short
   implicit def instant[A](v: java.time.Instant): A =>: java.time.Instant
   implicit def localDate[A](v: java.time.LocalDate): A =>: java.time.LocalDate
-  implicit def tuple2[A, B, C](t: (A =>: B, A =>: C)): A =>: (B, C)
-
-  implicit def tuple2Lift[A, B, C](
-    t: (B, C)
-  )(implicit ev1: B => A =>: B, ev2: C => A =>: C): A =>: (B, C) =
-    tuple2((ev1(t._1), ev2(t._2)))
-
+  implicit def tuple2[A, B, C](t: (A =>: B, A =>: C)): A =>: (B, C) =
+    stdLib.fanOut(t._1, t._2)
+  implicit def tuple2Lift[A, B, C](t: (B, C))(implicit ev1: B => A =>: B, ev2: C => A =>: C): A =>: (B, C) =
+    stdLib.fanOut(ev1(t._1), ev2(t._2))
   implicit def tuple2Lift1[A, B, C](t: (A =>: B, C))(implicit ev: C => A =>: C): A =>: (B, C) =
-    tuple2((t._1, ev(t._2)))
-
-  implicit def tuple2Lift2[A, B, C](t: (B, A =>: C))(implicit ev1: B => A =>: B): A =>: (B, C) =
-    tuple2((ev1(t._1), t._2))
+    stdLib.fanOut(t._1, ev(t._2))
+  implicit def tuple2Lift2[A, B, C](t: (B, A =>: C))(implicit ev: B => A =>: B): A =>: (B, C) =
+    stdLib.fanOut(ev(t._1), t._2)
 
   val setOps: Ops[DataSet]
   val streamOps: Ops[DataStream]

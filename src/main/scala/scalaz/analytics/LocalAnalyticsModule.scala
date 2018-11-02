@@ -44,9 +44,8 @@ trait LocalAnalyticsModule extends AnalyticsModule {
   implicit override val doubleType: Type[scala.Double]       = LocalType(Reified.Double)
   implicit override val doubleNumeric: Numeric[scala.Double] = LocalNumeric[scala.Double]
 
-  implicit override val decimalType: LocalType[scala.math.BigDecimal] = LocalType(
-    Reified.BigDecimal
-  )
+  implicit override val decimalType: LocalType[scala.math.BigDecimal] =
+    LocalType(Reified.BigDecimal)
   implicit override val decimalNumeric: Numeric[scala.math.BigDecimal] =
     LocalNumeric[scala.BigDecimal]
 
@@ -113,7 +112,10 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     case class Iter[A](rType: Reified, data: Iterable[A]) extends LocalDataStream
 
     case class Map(d: LocalDataStream, f: RowFunction)    extends LocalDataStream
+    case class FlatMap(d: LocalDataStream, f: RowFunction) extends LocalDataStream
     case class Filter(d: LocalDataStream, f: RowFunction) extends LocalDataStream
+    case class AggregateBy(d: LocalDataStream, g: RowFunction, init: RowFunction, f: RowFunction)
+      extends LocalDataStream
 
     case class Fold(d: LocalDataStream, initial: RowFunction, f: RowFunction, window: Window)
         extends LocalDataStream
@@ -123,12 +125,19 @@ trait LocalAnalyticsModule extends AnalyticsModule {
   private val ops: Ops[DataSet] = new Ops[DataSet] {
     override def map[A, B](ds: LocalDataStream)(f: A =>: B): LocalDataStream =
       LocalDataStream.Map(ds, f)
+
+    override def flatMap[A, B](ds: LocalDataStream)(f: A =>: DataSet[B]): LocalDataStream =
+      LocalDataStream.FlatMap(ds, f)
+
     override def filter[A](ds: LocalDataStream)(f: A =>: Boolean): LocalDataStream =
       LocalDataStream.Filter(ds, f)
 
-    override def fold[A, B](ds: LocalDataStream)(window: Window)(initial: B =>: B)(
-      f: A =>: B
-    ): LocalDataStream = LocalDataStream.Fold(ds, initial, f, window)
+    override def aggregateBy[A, K, V](ds: LocalDataStream)(g: A =>: K)(init: K =>: V)(f: A =>: V): LocalDataStream =
+      LocalDataStream.AggregateBy(ds, g, init, f)
+
+    override def fold[A, B](ds: LocalDataStream)(window: Window)(initial: B =>: B)(f: A =>: B): LocalDataStream =
+      LocalDataStream.Fold(ds, initial, f, window)
+
     override def distinct[A](ds: LocalDataStream)(window: Window): LocalDataStream =
       LocalDataStream.Distinct(ds, window)
   }
@@ -157,6 +166,9 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     case class ExtractFst(reified: Reified)                   extends RowFunction
     case class ExtractSnd(reified: Reified)                   extends RowFunction
 
+    case class SplitString(pattern: String)                   extends RowFunction
+    case object Concat                                        extends RowFunction
+
     // constants
     case class IntLiteral(value: Int)                            extends RowFunction
     case class LongLiteral(value: Long)                          extends RowFunction
@@ -170,7 +182,6 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     case class ShortLiteral(value: Short)                        extends RowFunction
     case class InstantLiteral(value: Instant)                    extends RowFunction
     case class LocalDateLiteral(value: LocalDate)                extends RowFunction
-    case class Tuple2Literal(fst: RowFunction, snd: RowFunction) extends RowFunction
   }
 
   override val stdLib: StandardLibrary = new StandardLibrary {
@@ -191,6 +202,10 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     override def fst[A: Type, B]: (A, B) =>: A = RowFunction.ExtractFst(Type[A].reified)
 
     override def snd[A, B: Type]: (A, B) =>: B = RowFunction.ExtractSnd(Type[B].reified)
+
+    override def strSplit[F[_]](pattern: String): String =>: F[String] = RowFunction.SplitString(pattern)
+
+    override def concat: (String, String) =>: String = RowFunction.Concat
   }
 
   override def empty[A: Type]: LocalDataStream = LocalDataStream.Empty(LocalType.typeOf[A])
@@ -213,8 +228,6 @@ trait LocalAnalyticsModule extends AnalyticsModule {
   implicit override def short[A](v: scala.Short): A =>: Short       = RowFunction.ShortLiteral(v)
   implicit override def instant[A](v: Instant): A =>: Instant       = RowFunction.InstantLiteral(v)
   implicit override def localDate[A](v: LocalDate): A =>: LocalDate = RowFunction.LocalDateLiteral(v)
-  implicit override def tuple2[A, B, C](t: (A =>: B, A =>: C)): A =>: (B, C) =
-    RowFunction.Tuple2Literal(t._1, t._2)
 
   // todo this needs more thought
   override def column[A: Type](str: String): Unknown =>: A =
@@ -226,7 +239,7 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     localRun(dataStream)
 
   def localRun[A](dataStream: LocalDataStream): IO[Throwable, Seq[A]] =
-    compile(dataStream)
+    IO.syncThrowable(compile(dataStream)).attempt.flatMap(_.fold((e: Throwable) => IO.fail(e), identity))
 
   def compile[A](dataStream: LocalDataStream): IO[Throwable, Seq[A]] = dataStream match {
     case LocalDataStream.Empty(_) =>
@@ -234,18 +247,33 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     case LocalDataStream.Iter(_, data) =>
       IO.point(data.asInstanceOf[Iterable[A]].toSeq)
     case LocalDataStream.Map(data, fun) =>
-      val funCompiled = compile[A, A](fun)
+      val funCompiled = compile[Any, A](fun)
       compile(data).flatMap(seq => funCompiled.map(seq.map(_)))
+    case LocalDataStream.FlatMap(data, fun) =>
+      val funCompiled = compile[Any, Seq[A]](fun)
+      compile(data).flatMap(seq => funCompiled.map(seq.flatMap(_)))
     case LocalDataStream.Filter(data, fun) =>
       val funCompiled = compile[A, Boolean](fun)
       compile(data).flatMap(seq => funCompiled.map(seq.filter))
+    case LocalDataStream.AggregateBy(data, g, init, fun) =>
+      val gCompiled = compile[Any, Any](g)
+      val initCompiled = compile[Any, Any](init)
+      val fCompiled = compile[(Any, Any), Any](fun)
+      compile(data).flatMap(seq => gCompiled.par(initCompiled).par(fCompiled) map {
+        case ((gfn, zero), f) =>
+          (seq.groupBy(gfn) map {
+            case (k, vs) =>
+              val res = vs.fold(zero(k))((v, a) => f((v, a)))
+              (k, res)
+          }).toSeq.asInstanceOf[Seq[A]]
+      })
     case LocalDataStream.Distinct(data, _) =>
       compile(data).map(_.distinct)
     case LocalDataStream.Fold(data, init, fun, _) =>
-      val initCompiled = compile[A, A](init)
-      val funCompiled = compile2[A, A](fun)
+      val initCompiled = literal[A](init)
+      val funCompiled = compile[(A, A), A](fun)
       compile(data).flatMap(seq => initCompiled.par(funCompiled).map {
-        case (zero, f) => Seq(seq.fold(zero(null.asInstanceOf[A]))(f))
+        case (zero, f) => Seq(seq.fold(zero)((b, a) => f((b, a))))
       })
     case _ =>
       IO.fail(new IllegalArgumentException("something goes wrong"))
@@ -256,10 +284,29 @@ trait LocalAnalyticsModule extends AnalyticsModule {
       literal[B](lit).flatMap(mkEmptyFun1)
     case RowFunction.Id(_) =>
       IO.point(identityFun[A, B])
+    case RowFunction.SplitString(pattern) =>
+      IO.point({ a: String => a.split(pattern).toSeq}.asInstanceOf[A => B])
     case RowFunction.Compose(op, RowFunction.FanOut(left, right)) if isBinaryOp(op) =>
       compileOp[A, B](op).par(compile[A, A](left)).par(compile[A, A](right)).map {
         case ((fun, l), r) => x: A => fun(l(x), r(x))
       }
+    case RowFunction.Compose(f, g) =>
+      compile[Any, B](f).par(compile[A, Any](g)) flatMap {
+        case (fc, gc) => scalaz.zio.console.putStrLn(f.toString + "\n" + g.toString).flatMap(_ => IO.now {
+          (x: A) => fc(gc(x))
+        })
+      }
+    case RowFunction.FanOut(l, r) =>
+      compile[A, Any](l).par(compile[A, Any](r)) map {
+        case (fl, fr) => (a: A) => (fl(a), fr(a)).asInstanceOf[B]
+      }
+    case RowFunction.Split(f, g) =>
+      compile[Any, Any](f).par(compile[Any, Any](g)) map {
+        case (fab, gcd) =>
+          ((ac: (Any, Any)) => (fab(ac._1), gcd(ac._2))).asInstanceOf[A => B]
+      }
+    case RowFunction.ExtractFst(_) => IO.now(((p: (Any, Any)) => p._1).asInstanceOf[A => B])
+    case RowFunction.ExtractSnd(_) => IO.now(((p: (Any, Any)) => p._2).asInstanceOf[A => B])
   }
 
   def compile2[A, B](rowFunction: RowFunction): IO[Throwable, (A, A) => B] = rowFunction match {
@@ -275,6 +322,7 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     case RowFunction.Diff(rType) => integral[A](rType).map(diffFun)
     case RowFunction.Mod(rType) => integral[A](rType).map(modFun)
     case RowFunction.GreaterThan(rType) => integral[A](rType).map(greaterThan)
+    case RowFunction.Concat => IO.now(((a: String, b: String) => a + b).asInstanceOf[(A, A) => B])
     case _ => IO.fail(new NotImplementedError)
   }
 
@@ -312,6 +360,9 @@ trait LocalAnalyticsModule extends AnalyticsModule {
     case RowFunction.Diff(_) => true
     case RowFunction.Mod(_) => true
     case RowFunction.GreaterThan(_) => true
+    case RowFunction.Concat => true
+    case RowFunction.ExtractFst(_) => true
+    case RowFunction.ExtractSnd(_) => true
     case _ => false
   }
 
